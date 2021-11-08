@@ -1,7 +1,6 @@
 using Dolang: sanitize
 using Lerche: Tree, Token
 
-import Dolo
 using Dolo: ModelCalibration
 import Dolang: solve_triangular_system
 
@@ -20,20 +19,18 @@ using DataStructures: OrderedDict
 # defind language understood in yaml files
 language = minilang
 
-abstract type AbstractModel{ID} end
-
-mutable struct Model{ID} <: AbstractModel{ID}
+mutable struct Model{ID, ExoT} <: AbstractModel{ExoT}
 
     data::YAML.MappingNode
     symbols::Dict{Symbol, Vector{Symbol}}
     calibration::ModelCalibration
-    exogenous
+    exogenous::ExoT
     domain::AbstractDomain
     factories
     definitions
 
-    function Model{ID}(data::YAML.Node) where ID
-        model = new{ID}(data)
+    function Model{ID, ExoT}(data::YAML.Node) where ID where ExoT
+        model = new{ID, ExoT}(data)
         model.calibration = get_calibration(model)
         model.symbols = get_symbols(model)
         model.exogenous = get_exogenous(model)
@@ -47,7 +44,7 @@ mutable struct Model{ID} <: AbstractModel{ID}
             Core.eval(Dolo, code)
         end
 
-        # # Create definitions
+        # Create definitions
         defs = get_definitions(model; stringify=true)
         model.definitions = defs
         definitions = OrderedDict{Symbol, SymExpr}( [(stringify(k),v) for (k,v) in defs])
@@ -69,6 +66,30 @@ mutable struct Model{ID} <: AbstractModel{ID}
 
 end
 
+id(::Model{ID}) where {ID} = ID
+
+
+function check_exogenous_type(data)
+    if !("exogenous" in keys(data))
+        return EmptyProcess
+    end
+    exo = data["exogenous"]
+    exo_types = [exo[k].tag for k in keys(exo)]
+
+    iid_types = ("!UNormal", "!ULogNormal", "!Normal", "!MvNormal", "!ConstantProcess")
+    mc_types = ("!MarkovChain", "!ConstantProcess")
+    acorr_types = ("!AR1", "!VAR1", "!ConstantProcess")
+
+    if exo_types ⊆ iid_types
+        return   IIDExogenous
+    elseif exo_types ⊆ mc_types
+        return DiscreteProcess
+    else
+        return ContinuousProcess
+    end
+end
+
+
 function Model(url::AbstractString; print_code=false)
 
     # it looks like it would be cool to use the super constructor ;-)
@@ -81,7 +102,8 @@ function Model(url::AbstractString; print_code=false)
     data = Dolang.yaml_node_from_string(txt)
     id = gensym()
     fname = basename(url)
-    return Model{id}(data)
+    typ = check_exogenous_type(data)
+    return Model{id, typ}(data)
 
 end
 
@@ -113,7 +135,15 @@ function get_defined_variables(model::Model)
     if !("definitions" in keys(model.data))
         return Symbol[]
     else
-        return [Symbol(e) for e in keys(model.data["definitions"])]
+        # TODO: this is awfully redundant. This should be done "after" definitions are parsed
+        try
+            # OBSOLETE
+            return [Symbol(e) for e in keys(model.data["definitions"])]
+        catch
+            defeqs = Dolang.parse_assignment_block(model.data["definitions"].value).children
+            return [Symbol(eq.children[1].children[1].children[1].value) for eq in defeqs]
+
+        end
     end
 end
 
@@ -154,11 +184,14 @@ function get_exogenous(model::AModel)
 
 end
 
-function get_calibration(model::Model)
+function get_calibration(model::Model; kwargs...)
     calib = model.data[:calibration]
     # prep calib: parse to Expr, Symbol, or Number
     _calib  = OrderedDict{Symbol,Union{Expr,Symbol,Number}}()
     # add calibration for definitions
+    for (k,v) in kwargs
+        calib[k].value = string(v)
+    end
     for k in keys(calib)
         x = Dolang.parse_equation(calib[k].value)
         e = Dolang.convert(Expr, x, stringify=false)
@@ -176,22 +209,19 @@ function set_calibration!(model::Model, key::Symbol, value)
     model.data[:calibration][key].value = string(value)
     model.calibration = get_calibration(model)
     model.exogenous = get_exogenous(model)
-    model.domain = get_domain(model)
+    model.domain = get_domain(model);
 end
 
-function set_calibration!(model::Model, values::AbstractDict{Symbol, Any})
+function set_calibration!(model::Model; values...)
     calib = model.data[:calibration]
     for (k,v) in values
         calib[k].value = string(v)
     end
     model.calibration = get_calibration(model)
     model.exogenous = get_exogenous(model)
-    model.domain = get_domain(model)
+    model.domain = get_domain(model);
 end
 
-function set_calibration!(model::Model; kwargs...)
-    set_calibration!(model, Dict(kwargs))
-end
 
 
 function get_equation_block(model, eqname; stringify=true)
@@ -285,44 +315,88 @@ function get_domain(model::Model)::AbstractDomain
     end
 
     domain = model.data["domain"]
+    
+    kk = keys(domain)
+    if "min" in kk
+        # TODO: deprecation warning
+        calib = model.calibration.flat
+        min = [Dolang.eval_node(domain[(k)][1], calib) for k in states]
+        max = [Dolang.eval_node(domain[(k)][2], calib) for k in states]
+        return Domain(states, min, max)
 
-    calib = model.calibration.flat
-
-    # TODO deal with empty dict and make robust construction
-    min = [Dolang.eval_node(domain[(k)][1], calib) for k in states]
-    max = [Dolang.eval_node(domain[(k)][2], calib) for k in states]
-    return Domain(states, min, max)
+    else
+        calib = model.calibration.flat
+        kk = tuple([Symbol(k) for k in keys(domain)]...)
+        ss = tuple(states...)
+        if kk != ss
+            error("The declaration order in the domain section ($kk) must match the symbols orders ($ss)")
+        end
+        vals = [Dolang.eval_node(domain[k], calib) for k in kk]
+        min = [e[1] for e in vals]
+        max = [e[2] for e in vals]
+        return Domain(states, min, max)
+    end
 
 end
 
 function get_definitions(model::Model; tshift=0, stringify=false) # ::OrderedDict{Tuple{Symbol,Int}}
+    
+    # return OrderedDict{Tuple{Symbol,Int64},Union{Expr, Number, Symbol}}()
+
     # parse defs so values are Expr
-    if "definitions" in keys(model.data)
-        defs = model.data[:definitions]
-    else
+    if !("definitions" in keys(model.data))
+        return OrderedDict{Tuple{Symbol,Int64},Union{Expr, Number, Symbol}}()
+    end
+
+    if model.data["definitions"].tag == "tag:yaml.org,2002:map"
+
+        # LEGACY
         defs = Dict()
-    end
-    dynvars = string.( cat(get_variables(model), keys(defs)...; dims=1) )
 
-    _defs =  OrderedDict{Tuple{Symbol,Int64},Union{Expr, Number, Symbol}}()  # {Symbol,Int}()
+        dynvars = string.( cat(get_variables(model), keys(defs)...; dims=1) )
 
-    for (kkk,v) in defs
-        kk = Dolang.parse_equation(kkk)
-        if kk.data == "symbol"
-            k = kk.children[1].value
-        elseif kk.data=="variable"
-            k = kk.children[1].children[1].value
-        else
-            error("Invalid key.")
+        _defs =  OrderedDict{Tuple{Symbol,Int64},Union{Expr, Number, Symbol}}()  # {Symbol,Int}()
+
+        for (kkk,v) in defs
+            kk = Dolang.parse_equation(kkk)
+            if kk.data == "symbol"
+                k = kk.children[1].value
+            elseif kk.data=="variable"
+                k = kk.children[1].children[1].value
+            else
+                error("Invalid key.")
+            end
+            vv = Dolang.parse_equation(v.value; variables=(dynvars))::LTree
+            if tshift != 0
+                vv = Dolang.time_shift(vv, tshift)::LTree
+            end
+            _defs[(Symbol(k),tshift)] = Dolang.convert(Expr, vv; stringify=stringify)::SymExpr
         end
-        vv = Dolang.parse_equation(v.value; variables=(dynvars))::LTree
-        if tshift != 0
-            vv = Dolang.time_shift(vv, tshift)::LTree
+
+        return _defs
+
+    else
+
+        @assert model.data["definitions"].tag == "tag:yaml.org,2002:str"
+        _defs =  OrderedDict{Tuple{Symbol,Int64},Union{Expr, Number, Symbol}}()  # {Symbol,Int}()
+        equations = Dolang.parse_assignment_block(model.data["definitions"].value).children
+        # TODO : check that equations are correct
+        for eq in equations
+            dest, val = eq.children
+            # TODO : create conveniences functions in dolang to avoid the follwowing
+            name = dest.children[1].children[1].value
+            # TODO : check that name is already defined at this stage
+            t = parse(Int, dest.children[2].children[1].value)
+
+            @assert t == 0
+
+            vv = Dolang.time_shift(val, tshift)
+
+            _defs[(Symbol(name),tshift)] = Dolang.convert(Expr, vv; stringify=stringify)::SymExpr
         end
-        _defs[(Symbol(k),tshift)] = Dolang.convert(Expr, vv; stringify=stringify)::SymExpr
+        return _defs
     end
 
-    return _defs
 end
 
 
