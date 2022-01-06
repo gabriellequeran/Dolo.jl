@@ -29,6 +29,16 @@ struct distG{ID, n_m, n_s, n_x, Gx, Ge}
 
 end
 
+"""
+Takes a model and its solution and returns an object of type distG.
+
+# Arguments
+* `model` : model used
+* `sol`: solution of the model obtained after using e.g. improved_time_iteration
+
+# Returns
+* a distG object for which we have access to the model, the grid, the discretized process, s0, x0 and μ0
+"""
 function distG(model, sol)
     ID = id(model)
     grid_endo = sol.dr.grid_endo
