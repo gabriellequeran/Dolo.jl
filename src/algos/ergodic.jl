@@ -210,10 +210,10 @@ function transition_matrix(model, dp, x0::MSM{<:SVector{n_x}}, grid; exo=nothing
 end
 
 
-function transition_matrix(model, sol; diff=false)
+function transition_matrix(model, sol; diff=false, exo=nothing)
     x0 = Dolo.MSM([sol.dr(i, sol.dr.grid_endo.nodes) for i=1:max(1,Dolo.n_nodes(sol.dr.grid_exo))])
     grid = ProductGrid(sol.dr.grid_exo, sol.dr.grid_endo)
-    Dolo.transition_matrix(model, sol.dprocess, x0, grid; diff=diff);
+    Dolo.transition_matrix(model, sol.dprocess, x0, grid; diff=diff, exo=nothing);
 end
 
 function transition_matrix(G::distG; dp=G.dprocess, x0=G.x0, grid=G.grid, exo=nothing, diff=false)
@@ -275,10 +275,13 @@ function trembling_foot!(Π, dΠ, S::Vector{Point{d}}, S_x::Vector{SMatrix{d,n_x
 
         Sn = S[n]
         Sn_x = S_x[n]
-
+        
+        inbound = (0. .<= Sn) .& ( Sn .<= 1.0)
+        
         Sn = min.(max.(Sn, 0.0),1.0)
         qn = div.(Sn, δ)
         qn = max.(0, qn)
+        # inbound = inbound .& (qn .<= shape_Π[2:d+1].-2)
         qn = min.(qn, shape_Π[2:d+1].-2)
         λn = (Sn./δ.-qn) # ∈[0,1[ by construction
         qn_ = round.(Int,qn) .+ 1
@@ -292,20 +295,12 @@ function trembling_foot!(Π, dΠ, S::Vector{Point{d}}, S_x::Vector{SMatrix{d,n_x
 
         Π[indexes_to_be_modified...] .+= w.*rhs_Π
 
-        # for k=1:d
-        #     λ_vec =  tuple( (i==k ? SVector( -1. /δ[k], 1. / δ[k]) : (SVector((1-λn[i]),λn[i])) for i in 1:d)... )
-        #     A = outer(λ_vec...)
-        #     rhs_dΠ = outer2(A, Sn_x[k,:])
-        #     dΠ[indexes_to_be_modified...] .+= w*rhs_dΠ
-        # end
-        
-        @assert d==1
-        
-        λ_vec =  (SVector( -1. /δ[1], 1. / δ[1]), )
-        A = outer(λ_vec...)
-        rhs_dΠ = outer2(A, Sn_x[1,:])
-        rhs_dΠ = [ -1. /δ[1].*Sn_x[1,:] , 1. / δ[1].*Sn_x[1,:]]
-        dΠ[indexes_to_be_modified...] .+= w*rhs_dΠ
+        for k=1:d
+            λ_vec =  tuple( (i==k ? SVector( -1. /δ[k] * inbound[k], 1. / δ[k] * inbound[k]) : (SVector((1-λn[i]),λn[i])) for i in 1:d)... )
+            A = outer(λ_vec...)
+            rhs_dΠ = outer2(A, Sn_x[k,:])
+            dΠ[indexes_to_be_modified...] .+= w*rhs_dΠ
+        end
         
     end
 
@@ -315,8 +310,6 @@ end
 
 """
 Computes the outer product.
-
-TODO: define the outer product
 
 # Argument
 * `λn_weight_vector::Vararg{Point{2}}`: tuple of Point{2} to be multiplied by outer product
@@ -329,5 +322,16 @@ function outer(λn_weight_vector::Vararg{SVector{2}})
 end
 
 # TODO: define and document
+
+"""
+Computes an outer product between a vector and a matrix and returns a vector of matrices.
+
+# Arguments
+* `A` : SVector of any size
+* `x`: matrix of any size
+
+# Returns
+* a sized vector obtained by making the outer product of A and x and dividing the matrix obtained in a vector of matrices for which the value of the A[i] term changes
+"""
 outer2(A, x) = [A[i]*x for i in CartesianIndices(A)]
 
